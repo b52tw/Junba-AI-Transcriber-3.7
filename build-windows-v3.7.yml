@@ -1,0 +1,252 @@
+name: Build Windows v3.7 Dual Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    paths:
+      - '**.py'
+      - '**.spec'
+      - 'requirements.txt'
+      - 'hooks/**'
+      - 'packaging/**'
+      - '.github/workflows/build-windows-v3.7.yml'
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  validate:
+    name: Validate source
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python 3.11 x64
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: 'x64'
+          cache: 'pip'
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
+          python -m pip check
+      - name: Source validation
+        shell: pwsh
+        run: |
+          python -m compileall -q main.py app tests
+          pytest -q tests
+          $env:QT_QPA_PLATFORM = 'offscreen'
+          python main.py --ui-self-test "$pwd/UI_SELFTEST_SOURCE.txt"
+          if (-not (Select-String -Path "$pwd/UI_SELFTEST_SOURCE.txt" -Pattern 'UI_SELFTEST_OK' -Quiet)) { throw 'Source UI self-test failed' }
+
+  portable:
+    name: Build Portable x64
+    needs: validate
+    runs-on: windows-latest
+    timeout-minutes: 150
+    env:
+      WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+      WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python 3.11 x64
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: 'x64'
+          cache: 'pip'
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -r requirements.txt
+          python -m pip check
+      - name: Build Portable
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean JunbaAITranscriber_portable.spec
+          $exe = "$pwd/dist/Junba_AI_Transcriber_v3.7_Portable/Junba_AI_Transcriber_v3.7.exe"
+          if (!(Test-Path $exe)) { throw 'Portable EXE not found' }
+      - name: Portable self-tests
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          $exe = "$pwd/dist/Junba_AI_Transcriber_v3.7_Portable/Junba_AI_Transcriber_v3.7.exe"
+          foreach ($args in @(
+            @('--windowed-io-self-test', "$pwd/release/WINDOWED_IO_PORTABLE.txt"),
+            @('--self-test', "$pwd/release/SELFTEST_PORTABLE.txt"),
+            @('--ui-self-test', "$pwd/release/UI_SELFTEST_PORTABLE.txt")
+          )) {
+            $p = Start-Process -FilePath $exe -ArgumentList $args -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "Portable self-test failed: $($args[0])" }
+          }
+      - name: Restore optional Authenticode certificate
+        id: signing
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERT_PFX_BASE64) -or [string]::IsNullOrWhiteSpace($env:WINDOWS_CERT_PASSWORD)) {
+            'enabled=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            Write-Host 'Unsigned build: no Authenticode certificate configured.'
+            exit 0
+          }
+          [IO.File]::WriteAllBytes("$pwd/release/codesign.pfx", [Convert]::FromBase64String($env:WINDOWS_CERT_PFX_BASE64))
+          'enabled=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+      - name: Sign Portable EXE
+        if: steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe | Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw 'signtool.exe not found' }
+          $exe = "$pwd/dist/Junba_AI_Transcriber_v3.7_Portable/Junba_AI_Transcriber_v3.7.exe"
+          & $signtool.FullName sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f "$pwd/release/codesign.pfx" /p "$env:WINDOWS_CERT_PASSWORD" $exe
+          if ($LASTEXITCODE -ne 0) { throw 'Portable EXE signing failed' }
+          & $signtool.FullName verify /pa /v $exe
+          if ($LASTEXITCODE -ne 0) { throw 'Portable EXE signature verification failed' }
+      - name: Package Portable
+        shell: pwsh
+        run: |
+          $zip = "$pwd/release/Junba_AI_Transcriber_v3.7_Portable_Windows_x64.zip"
+          Compress-Archive -Path "$pwd/dist/Junba_AI_Transcriber_v3.7_Portable/*" -DestinationPath $zip -Force
+          $exe = "$pwd/dist/Junba_AI_Transcriber_v3.7_Portable/Junba_AI_Transcriber_v3.7.exe"
+          @(
+            "EXE  $((Get-FileHash $exe -Algorithm SHA256).Hash)  Junba_AI_Transcriber_v3.7.exe",
+            "ZIP  $((Get-FileHash $zip -Algorithm SHA256).Hash)  Junba_AI_Transcriber_v3.7_Portable_Windows_x64.zip"
+          ) | Set-Content "$pwd/release/SHA256SUMS_PORTABLE.txt" -Encoding UTF8
+          @"
+          峻爸 AI Transcriber v3.7 Portable
+          Build: GitHub Actions / Windows x64 / Python 3.11
+          PyInstaller: onedir, UPX disabled, asInvoker manifest
+          Authenticode signed: ${{ steps.signing.outputs.enabled }}
+          Security note: this build does not disable or bypass Chrome, Safe Browsing, SmartScreen, or Defender. A trusted Authenticode certificate is the recommended way to reduce false positives.
+          "@ | Set-Content "$pwd/release/BUILD_INFO_PORTABLE.txt" -Encoding UTF8
+      - name: Upload Portable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Junba-AI-Transcriber-v3.7-Portable-Windows-x64
+          path: |
+            release/Junba_AI_Transcriber_v3.7_Portable_Windows_x64.zip
+            release/SHA256SUMS_PORTABLE.txt
+            release/BUILD_INFO_PORTABLE.txt
+            release/SELFTEST_PORTABLE.txt
+            release/UI_SELFTEST_PORTABLE.txt
+            release/WINDOWED_IO_PORTABLE.txt
+          if-no-files-found: error
+          retention-days: 30
+      - name: Attest Portable ZIP provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: release/Junba_AI_Transcriber_v3.7_Portable_Windows_x64.zip
+      - name: Cleanup signing material
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path "$pwd/release/codesign.pfx") { Remove-Item "$pwd/release/codesign.pfx" -Force }
+
+  single-exe:
+    name: Build Single EXE x64
+    needs: validate
+    runs-on: windows-latest
+    timeout-minutes: 180
+    env:
+      WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+      WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python 3.11 x64
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: 'x64'
+          cache: 'pip'
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -r requirements.txt
+          python -m pip check
+      - name: Build Single EXE
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean JunbaAITranscriber_onefile.spec
+          $exe = "$pwd/dist/Junba_AI_Transcriber_v3.7.exe"
+          if (!(Test-Path $exe)) { throw 'Single EXE not found' }
+      - name: Single EXE self-tests
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          $exe = "$pwd/dist/Junba_AI_Transcriber_v3.7.exe"
+          foreach ($args in @(
+            @('--windowed-io-self-test', "$pwd/release/WINDOWED_IO_SINGLE.txt"),
+            @('--self-test', "$pwd/release/SELFTEST_SINGLE.txt"),
+            @('--ui-self-test', "$pwd/release/UI_SELFTEST_SINGLE.txt")
+          )) {
+            $p = Start-Process -FilePath $exe -ArgumentList $args -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "Single EXE self-test failed: $($args[0])" }
+          }
+      - name: Restore optional Authenticode certificate
+        id: signing
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERT_PFX_BASE64) -or [string]::IsNullOrWhiteSpace($env:WINDOWS_CERT_PASSWORD)) {
+            'enabled=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            Write-Host 'Unsigned build: no Authenticode certificate configured.'
+            exit 0
+          }
+          [IO.File]::WriteAllBytes("$pwd/release/codesign.pfx", [Convert]::FromBase64String($env:WINDOWS_CERT_PFX_BASE64))
+          'enabled=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+      - name: Sign Single EXE
+        if: steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe | Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw 'signtool.exe not found' }
+          $exe = "$pwd/dist/Junba_AI_Transcriber_v3.7.exe"
+          & $signtool.FullName sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f "$pwd/release/codesign.pfx" /p "$env:WINDOWS_CERT_PASSWORD" $exe
+          if ($LASTEXITCODE -ne 0) { throw 'Single EXE signing failed' }
+          & $signtool.FullName verify /pa /v $exe
+          if ($LASTEXITCODE -ne 0) { throw 'Single EXE signature verification failed' }
+      - name: Package Single EXE
+        shell: pwsh
+        run: |
+          Copy-Item "$pwd/dist/Junba_AI_Transcriber_v3.7.exe" "$pwd/release/Junba_AI_Transcriber_v3.7_Single_EXE_Windows_x64.exe" -Force
+          $exe = "$pwd/release/Junba_AI_Transcriber_v3.7_Single_EXE_Windows_x64.exe"
+          "EXE  $((Get-FileHash $exe -Algorithm SHA256).Hash)  Junba_AI_Transcriber_v3.7_Single_EXE_Windows_x64.exe" | Set-Content "$pwd/release/SHA256SUMS_SINGLE.txt" -Encoding UTF8
+          @"
+          峻爸 AI Transcriber v3.7 Single EXE
+          Build: GitHub Actions / Windows x64 / Python 3.11
+          PyInstaller: onefile, UPX disabled, asInvoker manifest
+          Authenticode signed: ${{ steps.signing.outputs.enabled }}
+          Security note: this build does not disable or bypass Chrome, Safe Browsing, SmartScreen, or Defender. A trusted Authenticode certificate is the recommended way to reduce false positives.
+          "@ | Set-Content "$pwd/release/BUILD_INFO_SINGLE.txt" -Encoding UTF8
+      - name: Upload Single EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Junba-AI-Transcriber-v3.7-Single-EXE-Windows-x64
+          path: |
+            release/Junba_AI_Transcriber_v3.7_Single_EXE_Windows_x64.exe
+            release/SHA256SUMS_SINGLE.txt
+            release/BUILD_INFO_SINGLE.txt
+            release/SELFTEST_SINGLE.txt
+            release/UI_SELFTEST_SINGLE.txt
+            release/WINDOWED_IO_SINGLE.txt
+          if-no-files-found: error
+          retention-days: 30
+      - name: Attest Single EXE provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: release/Junba_AI_Transcriber_v3.7_Single_EXE_Windows_x64.exe
+      - name: Cleanup signing material
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path "$pwd/release/codesign.pfx") { Remove-Item "$pwd/release/codesign.pfx" -Force }
